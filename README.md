@@ -20,34 +20,14 @@ The `ui` folder also contains an optional desktop app that runs the servers as W
 
 The fastest way to get running:
 
-```yaml
-services:
-  hbbs:
-    image: databk/rustdesk-server:latest
-    container_name: hbbs
-    ports:
-      - 21115:21115
-      - 21116:21116
-      - 21116:21116/udp
-      - 21118:21118
-    command: hbbs -r <your-relay-server>:21117
-    volumes:
-      - ./data:/root
-    restart: unless-stopped
-
-  hbbr:
-    image: databk/rustdesk-server:latest
-    container_name: hbbr
-    ports:
-      - 21117:21117
-      - 21119:21119
-    command: hbbr
-    volumes:
-      - ./data:/root
-    restart: unless-stopped
+```bash
+curl -LO https://raw.githubusercontent.com/databk/rustdesk-server/master/docker-compose.yml
+docker compose up -d
 ```
 
-Start it with `docker compose up -d`, then point your RustDesk clients at `<your-server-host>` (ID server) and `<your-relay-server>:21117` (relay server). The public key your clients need is in `./data/id_ed25519.pub` after first start.
+The full definition lives in [docker-compose.yml](docker-compose.yml). Before starting, adjust the relay host in the `hbbs` command (`-r <your-relay-server>:21117`) to point at your own server.
+
+Then point your RustDesk clients at `<your-server-host>` (ID server) and `<your-relay-server>:21117` (relay server). The public key your clients need is in `./data/id_ed25519.pub` after first start.
 
 ### Ports
 
