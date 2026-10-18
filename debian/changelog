@@ -1,3 +1,9 @@
+rustdesk-server (1.1.0) UNRELEASED; urgency=medium
+
+  * Upstream release 1.1.0
+
+ -- RustDesk release workflow <noreply@rustdesk.com>  Sun, 18 Oct 2026 08:46:25 +0000
+
 rustdesk-server (1.1.15) UNRELEASED; urgency=medium
 
   * Fix: 127.0.0.1 is not loopback (#515)
