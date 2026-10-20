@@ -178,7 +178,7 @@ impl RendezvousServer {
     async fn handle_listener_inner(
         &mut self,
         stream: TcpStream,
-        addr: SocketAddr,
+        mut addr: SocketAddr,
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
@@ -218,6 +218,11 @@ impl RendezvousServer {
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let forwarded_ip = forwarded_ip_cell.lock().unwrap().clone();
+            // Behind a local reverse proxy every WS peer would otherwise be known by
+            // the proxy's address (e.g. 172.17.0.1 via docker-proxy). That address is
+            // handed to the other side in PunchHole/RequestRelay and ends up in the
+            // clients' connection audit, so use the forwarded client IP instead.
+            addr = Self::effective_ws_addr(addr, forwarded_ip.as_deref());
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
             // The RustDesk client never initiates keep-alives on a TCP/WS rendezvous
@@ -383,6 +388,25 @@ impl RendezvousServer {
         let stored = map.lock().await.get(&try_into_v4(addr)).cloned();
         if let Some(s) = stored {
             Self::send_to_sink(&mut *s.lock().await, RendezvousMessage::new()).await;
+        }
+    }
+
+    // Real client address for a WS connection that came through a reverse proxy.
+    // Forwarded headers are only honoured when the TCP peer is loopback or a
+    // private address (the proxy), so a direct client cannot spoof its address.
+    // The proxy-side port is kept, which keeps the address unique per connection.
+    fn effective_ws_addr(addr: SocketAddr, forwarded_ip: Option<&str>) -> SocketAddr {
+        let peer_ip = try_into_v4(addr).ip();
+        let from_proxy = match peer_ip {
+            std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+            std::net::IpAddr::V6(ip) => ip.is_loopback(),
+        };
+        if !from_proxy {
+            return addr;
+        }
+        match forwarded_ip.and_then(|ip| ip.parse::<std::net::IpAddr>().ok()) {
+            Some(ip) => try_into_v4(SocketAddr::new(ip, addr.port())),
+            None => addr,
         }
     }
 
