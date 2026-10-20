@@ -220,19 +220,40 @@ impl RendezvousServer {
             let forwarded_ip = forwarded_ip_cell.lock().unwrap().clone();
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
-            while let Ok(Some(res)) = timeout(30_000, b.next()).await {
+            // The RustDesk client never initiates keep-alives on a TCP/WS rendezvous
+            // connection, it only answers an empty message with an empty message.
+            // So the server has to send them; otherwise an idle registered peer is
+            // dropped after the idle timeout and has to reconnect and re-register.
+            let mut registered_id: Option<String> = None;
+            let mut last_recv = Instant::now();
+            let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+            loop {
+                let res = tokio::select! {
+                    res = b.next() => res,
+                    _ = heartbeat.tick() => {
+                        if last_recv.elapsed() > IDLE_TIMEOUT {
+                            break;
+                        }
+                        self.send_heartbeat(&mut sink, addr, ws).await;
+                        continue;
+                    }
+                };
+                let Some(res) = res else {
+                    break;
+                };
+                last_recv = Instant::now();
                 match res {
                     Ok(tungstenite::Message::Binary(bytes)) => {
-                        // Handle heartbeat (empty message), mirroring the plain-TCP
-                        // branch below. Without this, a client's periodic empty
-                        // keep-alive is treated as "unhandled" by handle_tcp(),
-                        // which returns false and closes the WS connection.
+                        // Heartbeat answer (empty message): refresh the peer's
+                        // registration so it stays online. Do not echo it, the
+                        // client would echo back and both sides would ping-pong.
                         if bytes.is_empty() {
-                            if let Some(s) = sink.as_mut() {
-                                Self::send_to_sink(s, RendezvousMessage::new()).await;
-                            }
+                            self.touch_peer(registered_id.as_deref(), addr).await;
                             continue;
                         }
+                        Self::note_registration(&bytes, &mut registered_id);
                         if !self
                             .handle_tcp(&bytes, &mut sink, addr, key, ws, forwarded_ip.as_deref())
                             .await
@@ -242,13 +263,12 @@ impl RendezvousServer {
                     }
                     Ok(tungstenite::Message::Close(_)) => {
                         // Explicit close frame: stop immediately instead of waiting
-                        // for the 30s idle timeout to expire.
+                        // for the idle timeout to expire.
                         break;
                     }
                     Ok(_) => {
                         // Ping/Pong/Text/Frame: not part of the protocol, ignore
-                        // but keep the connection alive (already resets the
-                        // 30s timeout since we got here).
+                        // but keep the connection alive.
                     }
                     Err(err) => {
                         log::debug!("WS read error from {:?}: {}", addr, err);
@@ -290,7 +310,27 @@ impl RendezvousServer {
                 }
             }
 
-            while let Ok(Some(Ok(bytes))) = timeout(REG_TIMEOUT as u64, b.next()).await {
+            // Same keep-alive handling as the WS branch above.
+            let mut registered_id: Option<String> = None;
+            let mut last_recv = Instant::now();
+            let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            heartbeat.tick().await;
+            loop {
+                let res = tokio::select! {
+                    res = b.next() => res,
+                    _ = heartbeat.tick() => {
+                        if last_recv.elapsed() > IDLE_TIMEOUT {
+                            break;
+                        }
+                        self.send_heartbeat(&mut sink, addr, ws).await;
+                        continue;
+                    }
+                };
+                let Some(Ok(bytes)) = res else {
+                    break;
+                };
+                last_recv = Instant::now();
                 // Decrypt if encryption is enabled
                 let bytes = if let Some(enc) = recv_encrypt.as_mut() {
                     let mut bytes = bytes;
@@ -303,15 +343,13 @@ impl RendezvousServer {
                     bytes
                 };
 
-                // Handle heartbeat (empty message)
+                // Heartbeat answer (empty message): refresh registration, no echo
                 if bytes.is_empty() {
-                    // Update last_reg_time if peer is registered
-                    if let Some(s) = sink.as_mut() {
-                        Self::send_to_sink(s, RendezvousMessage::new()).await;
-                    }
+                    self.touch_peer(registered_id.as_deref(), addr).await;
                     continue;
                 }
 
+                Self::note_registration(&bytes, &mut registered_id);
                 if !self
                     .handle_tcp(&bytes, &mut sink, addr, key, ws, None)
                     .await
@@ -332,5 +370,43 @@ impl RendezvousServer {
         }
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
+    }
+
+    // Sends an empty keep-alive message. After a successful RegisterPk the sink
+    // has been moved into ws_map / tcp_map, so look it up there in that case.
+    async fn send_heartbeat(&self, sink: &mut Option<Sink>, addr: SocketAddr, ws: bool) {
+        if let Some(s) = sink.as_mut() {
+            Self::send_to_sink(s, RendezvousMessage::new()).await;
+            return;
+        }
+        let map = if ws { &self.ws_map } else { &self.tcp_map };
+        let stored = map.lock().await.get(&try_into_v4(addr)).cloned();
+        if let Some(s) = stored {
+            Self::send_to_sink(&mut *s.lock().await, RendezvousMessage::new()).await;
+        }
+    }
+
+    // Remembers the id of a full RegisterPk (non-empty pk) seen on this connection.
+    fn note_registration(bytes: &[u8], registered_id: &mut Option<String>) {
+        if let Ok(msg) = RendezvousMessage::parse_from_bytes(bytes) {
+            if let Some(rendezvous_message::Union::RegisterPk(rk)) = msg.union {
+                if !rk.pk.is_empty() && !rk.id.is_empty() {
+                    *registered_id = Some(rk.id);
+                }
+            }
+        }
+    }
+
+    // Keeps a TCP/WS registered peer online while its connection is alive.
+    async fn touch_peer(&self, id: Option<&str>, addr: SocketAddr) {
+        let Some(id) = id else {
+            return;
+        };
+        if let Some(p) = self.pm.get_in_memory(id).await {
+            let mut p = p.write().await;
+            if p.socket_addr == addr {
+                p.last_reg_time = Instant::now();
+            }
+        }
     }
 }
